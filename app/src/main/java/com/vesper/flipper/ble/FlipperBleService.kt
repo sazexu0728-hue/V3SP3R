@@ -265,7 +265,7 @@ class FlipperBleService : Service() {
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
-    // Scanning - Now finds ALL potential Flippers, even renamed ones
+// Scanning - 完全放开过滤限制，确保所有设备都能被搜到
 
     @SuppressLint("MissingPermission")
     fun startScan() {
@@ -282,14 +282,6 @@ class FlipperBleService : Service() {
         _connectionState.value = ConnectionState.Scanning
         _discoveredDevices.value = emptyList()
         seedBondedFlippersIntoDiscoveredList()
-        broadScanStarted = false
-
-        // Filter by known Flipper service UUIDs so renamed devices are still discovered.
-        val flipperFilters = FLIPPER_SCAN_SERVICE_UUIDS.map { serviceUuid ->
-            ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(serviceUuid))
-                .build()
-        }
 
         val scanSettings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -297,24 +289,14 @@ class FlipperBleService : Service() {
             .build()
 
         try {
-            bleScanner?.startScan(flipperFilters, scanSettings, scanCallback)
+            // 将过滤条件设为 null，无限制扫描周围所有 BLE 广播
+            bleScanner?.startScan(null, scanSettings, scanCallback)
         } catch (e: IllegalStateException) {
             _connectionState.value = ConnectionState.Error("Failed to start BLE scan: ${e.message}")
             return
         }
 
-        // Fallback broad scan only if filtered scan found nothing after a short window.
-        serviceScope.launch {
-            delay(BROAD_SCAN_FALLBACK_DELAY_MS)
-            if (_connectionState.value is ConnectionState.Scanning &&
-                _discoveredDevices.value.isEmpty() &&
-                !broadScanStarted
-            ) {
-                startBroadScan()
-            }
-        }
-
-        // Auto-stop scan after timeout
+        // 超时自动停止扫描
         serviceScope.launch {
             delay(SCAN_TIMEOUT_MS)
             stopScan()
@@ -323,28 +305,13 @@ class FlipperBleService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun startBroadScan() {
-        if (!hasBluetoothPermissions()) return
-        if (broadScanStarted) return
-
-        // Broad scan without filters - catches renamed Flippers
-        val broadSettings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .build()
-
-        try {
-            bleScanner?.startScan(null, broadSettings, broadScanCallback)
-            broadScanStarted = true
-        } catch (_: IllegalStateException) {
-            // Keep silent; filtered scan remains primary path.
-        }
+        // 已合并至主扫描
     }
 
     @SuppressLint("MissingPermission")
     fun stopScan() {
         if (hasBluetoothPermissions()) {
             bleScanner?.stopScan(scanCallback)
-            bleScanner?.stopScan(broadScanCallback)
         }
         broadScanStarted = false
         if (_connectionState.value is ConnectionState.Scanning) {
@@ -366,73 +333,11 @@ class FlipperBleService : Service() {
         }
 
         override fun onScanFailed(errorCode: Int) {
-            // Fallback to broad scan when hardware rejects filtered mode.
-            if (!broadScanStarted) {
-                startBroadScan()
-            }
-            if (!broadScanStarted) {
-                _connectionState.value = ConnectionState.Error("Scan failed: $errorCode")
-            }
+            _connectionState.value = ConnectionState.Error("Scan failed: $errorCode")
         }
     }
 
-    // Broad scan callback - validates devices by checking for Flipper characteristics
-    private val broadScanCallback = object : ScanCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val hasKnownService = hasKnownFlipperService(result)
-            val normalizedAddress = normalizeBleAddress(result.device.address)
-            val wasConfirmedEarlier = normalizedAddress?.let { confirmedFlipperAddresses.contains(it) } == true
-            val hasKnownAddressPrefix = hasKnownFlipperAddressPrefix(result.device.address)
-            val hasLikelyFlipperName = isLikelyFlipperName(resolveScanDeviceName(result))
-            val hasLikelyManufacturerData = hasLikelyFlipperManufacturerData(result)
-
-            if (hasKnownService ||
-                wasConfirmedEarlier ||
-                hasKnownAddressPrefix ||
-                hasLikelyFlipperName ||
-                hasLikelyManufacturerData
-            ) {
-                addDiscoveredDevice(
-                    result = result,
-                    isConfirmedFlipper = hasKnownService ||
-                            wasConfirmedEarlier ||
-                            hasKnownAddressPrefix ||
-                            hasLikelyManufacturerData
-                )
-            }
-        }
-
-        @SuppressLint("MissingPermission")
-        override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            results.forEach { result ->
-                val hasKnownService = hasKnownFlipperService(result)
-                val normalizedAddress = normalizeBleAddress(result.device.address)
-                val wasConfirmedEarlier = normalizedAddress?.let { confirmedFlipperAddresses.contains(it) } == true
-                val hasKnownAddressPrefix = hasKnownFlipperAddressPrefix(result.device.address)
-                val hasLikelyFlipperName = isLikelyFlipperName(resolveScanDeviceName(result))
-                val hasLikelyManufacturerData = hasLikelyFlipperManufacturerData(result)
-                if (hasKnownService ||
-                    wasConfirmedEarlier ||
-                    hasKnownAddressPrefix ||
-                    hasLikelyFlipperName ||
-                    hasLikelyManufacturerData
-                ) {
-                    addDiscoveredDevice(
-                        result = result,
-                        isConfirmedFlipper = hasKnownService ||
-                                wasConfirmedEarlier ||
-                                hasKnownAddressPrefix ||
-                                hasLikelyManufacturerData
-                    )
-                }
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            // Silent fail for broad scan - filtered scan is primary
-        }
-    }
+    private val broadScanCallback = scanCallback
 
     @SuppressLint("MissingPermission")
     private fun addDiscoveredDevice(result: ScanResult, isConfirmedFlipper: Boolean) {
